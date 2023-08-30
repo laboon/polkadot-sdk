@@ -36,15 +36,14 @@ use crate::{
 use codec::Encode;
 use futures::future::FutureExt;
 use jsonrpsee::{
-	core::{async_trait, RpcResult},
-	types::{SubscriptionEmptyError, SubscriptionId, SubscriptionResult},
-	SubscriptionSink,
+	core::async_trait, types::SubscriptionId, PendingSubscriptionSink, SubscriptionSink,
 };
 use log::debug;
 use sc_client_api::{
 	Backend, BlockBackend, BlockchainEvents, CallExecutor, ChildInfo, ExecutorProvider, StorageKey,
 	StorageProvider,
 };
+use sc_rpc::utils::to_sub_message;
 use sp_api::CallApiAt;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
 use sp_core::{traits::CallContext, Bytes};
@@ -61,9 +60,6 @@ pub struct ChainHeadConfig {
 	pub subscription_max_pinned_duration: Duration,
 	/// The maximum number of ongoing operations per subscription.
 	pub subscription_max_ongoing_operations: usize,
-	/// The maximum number of items reported by the `chainHead_storage` before
-	/// pagination is required.
-	pub operation_max_storage_items: usize,
 }
 
 /// Maximum pinned blocks across all connections.
@@ -81,21 +77,15 @@ const MAX_PINNED_DURATION: Duration = Duration::from_secs(60);
 /// Note: The lower limit imposed by the spec is 16.
 const MAX_ONGOING_OPERATIONS: usize = 16;
 
-/// The maximum number of items the `chainHead_storage` can return
-/// before paginations is required.
-const MAX_STORAGE_ITER_ITEMS: usize = 5;
-
 impl Default for ChainHeadConfig {
 	fn default() -> Self {
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: MAX_PINNED_DURATION,
 			subscription_max_ongoing_operations: MAX_ONGOING_OPERATIONS,
-			operation_max_storage_items: MAX_STORAGE_ITER_ITEMS,
 		}
 	}
 }
-
 /// An API for chain head RPC calls.
 pub struct ChainHead<BE: Backend<Block>, Block: BlockT, Client> {
 	/// Substrate client.
@@ -108,9 +98,6 @@ pub struct ChainHead<BE: Backend<Block>, Block: BlockT, Client> {
 	subscriptions: Arc<SubscriptionManagement<Block, BE>>,
 	/// The hexadecimal encoded hash of the genesis block.
 	genesis_hash: String,
-	/// The maximum number of items reported by the `chainHead_storage` before
-	/// pagination is required.
-	operation_max_storage_items: usize,
 	/// Phantom member to pin the block type.
 	_phantom: PhantomData<Block>,
 }
@@ -135,32 +122,17 @@ impl<BE: Backend<Block>, Block: BlockT, Client> ChainHead<BE, Block, Client> {
 				config.subscription_max_ongoing_operations,
 				backend,
 			)),
-			operation_max_storage_items: config.operation_max_storage_items,
 			genesis_hash,
 			_phantom: PhantomData,
 		}
 	}
+}
 
-	/// Accept the subscription and return the subscription ID on success.
-	fn accept_subscription(
-		&self,
-		sink: &mut SubscriptionSink,
-	) -> Result<String, SubscriptionEmptyError> {
-		// The subscription must be accepted before it can provide a valid subscription ID.
-		sink.accept()?;
-
-		let Some(sub_id) = sink.subscription_id() else {
-			// This can only happen if the subscription was not accepted.
-			return Err(SubscriptionEmptyError)
-		};
-
-		// Get the string representation for the subscription.
-		let sub_id = match sub_id {
-			SubscriptionId::Num(num) => num.to_string(),
-			SubscriptionId::Str(id) => id.into_owned().into(),
-		};
-
-		Ok(sub_id)
+/// Helper to convert the `subscription ID` to a string.
+pub fn read_subscription_id_as_string(sink: &SubscriptionSink) -> String {
+	match sink.subscription_id() {
+		SubscriptionId::Num(n) => n.to_string(),
+		SubscriptionId::Str(s) => s.into_owned().into(),
 	}
 }
 
@@ -194,33 +166,27 @@ where
 		+ StorageProvider<Block, BE>
 		+ 'static,
 {
-	fn chain_head_unstable_follow(
-		&self,
-		mut sink: SubscriptionSink,
-		with_runtime: bool,
-	) -> SubscriptionResult {
-		let sub_id = match self.accept_subscription(&mut sink) {
-			Ok(sub_id) => sub_id,
-			Err(err) => {
-				sink.close(ChainHeadRpcError::InvalidSubscriptionID);
-				return Err(err)
-			},
-		};
-		// Keep track of the subscription.
-		let Some(sub_data) = self.subscriptions.insert_subscription(sub_id.clone(), with_runtime)
-		else {
-			// Inserting the subscription can only fail if the JsonRPSee
-			// generated a duplicate subscription ID.
-			debug!(target: LOG_TARGET, "[follow][id={:?}] Subscription already accepted", sub_id);
-			let _ = sink.send(&FollowEvent::<Block::Hash>::Stop);
-			return Ok(())
-		};
-		debug!(target: LOG_TARGET, "[follow][id={:?}] Subscription accepted", sub_id);
-
+	fn chain_head_unstable_follow(&self, pending: PendingSubscriptionSink, with_runtime: bool) {
 		let subscriptions = self.subscriptions.clone();
 		let backend = self.backend.clone();
 		let client = self.client.clone();
+
 		let fut = async move {
+			let Ok(sink) = pending.accept().await else { return };
+
+			let sub_id = read_subscription_id_as_string(&sink);
+
+			// Keep track of the subscription.
+			let Some(sub_data) = subscriptions.insert_subscription(sub_id.clone(), with_runtime)
+			else {
+				// Inserting the subscription can only fail if the JsonRPSee
+				// generated a duplicate subscription ID.
+				debug!(target: LOG_TARGET, "[follow][id={:?}] Subscription already accepted", sub_id);
+				let _ = sink.send(to_sub_message(&FollowEvent::<Block::Hash>::Stop)).await;
+				return
+			};
+			debug!(target: LOG_TARGET, "[follow][id={:?}] Subscription accepted", sub_id);
+
 			let mut chain_head_follow = ChainHeadFollower::new(
 				client,
 				backend,
@@ -236,15 +202,14 @@ where
 		};
 
 		self.executor.spawn("substrate-rpc-subscription", Some("rpc"), fut.boxed());
-		Ok(())
 	}
 
 	fn chain_head_unstable_body(
 		&self,
 		follow_subscription: String,
 		hash: Block::Hash,
-	) -> RpcResult<MethodResponse> {
-		let mut block_guard = match self.subscriptions.lock_block(&follow_subscription, hash, 1) {
+	) -> Result<MethodResponse, ChainHeadRpcError> {
+		let block_guard = match self.subscriptions.lock_block(&follow_subscription, hash, 1) {
 			Ok(block) => block,
 			Err(SubscriptionManagementError::SubscriptionAbsent) |
 			Err(SubscriptionManagementError::ExceededLimits) => return Ok(MethodResponse::LimitReached),
@@ -255,8 +220,6 @@ where
 			Err(_) => return Err(ChainHeadRpcError::InvalidBlock.into()),
 		};
 
-		let operation_id = block_guard.operation().operation_id();
-
 		let event = match self.client.block(hash) {
 			Ok(Some(signed_block)) => {
 				let extrinsics = signed_block
@@ -266,7 +229,7 @@ where
 					.map(|extrinsic| hex_string(&extrinsic.encode()))
 					.collect();
 				FollowEvent::<Block::Hash>::OperationBodyDone(OperationBodyDone {
-					operation_id: operation_id.clone(),
+					operation_id: block_guard.operation_id(),
 					value: extrinsics,
 				})
 			},
@@ -282,20 +245,23 @@ where
 				return Err(ChainHeadRpcError::InvalidBlock.into())
 			},
 			Err(error) => FollowEvent::<Block::Hash>::OperationError(OperationError {
-				operation_id: operation_id.clone(),
+				operation_id: block_guard.operation_id(),
 				error: error.to_string(),
 			}),
 		};
 
 		let _ = block_guard.response_sender().unbounded_send(event);
-		Ok(MethodResponse::Started(MethodResponseStarted { operation_id, discarded_items: None }))
+		Ok(MethodResponse::Started(MethodResponseStarted {
+			operation_id: block_guard.operation_id(),
+			discarded_items: None,
+		}))
 	}
 
 	fn chain_head_unstable_header(
 		&self,
 		follow_subscription: String,
 		hash: Block::Hash,
-	) -> RpcResult<Option<String>> {
+	) -> Result<Option<String>, ChainHeadRpcError> {
 		let _block_guard = match self.subscriptions.lock_block(&follow_subscription, hash, 1) {
 			Ok(block) => block,
 			Err(SubscriptionManagementError::SubscriptionAbsent) |
@@ -311,10 +277,9 @@ where
 			.header(hash)
 			.map(|opt_header| opt_header.map(|h| hex_string(&h.encode())))
 			.map_err(ChainHeadRpcError::FetchBlockHeader)
-			.map_err(Into::into)
 	}
 
-	fn chain_head_unstable_genesis_hash(&self) -> RpcResult<String> {
+	fn chain_head_unstable_genesis_hash(&self) -> Result<String, ChainHeadRpcError> {
 		Ok(self.genesis_hash.clone())
 	}
 
@@ -324,7 +289,7 @@ where
 		hash: Block::Hash,
 		items: Vec<StorageQuery<String>>,
 		child_trie: Option<String>,
-	) -> RpcResult<MethodResponse> {
+	) -> Result<MethodResponse, ChainHeadRpcError> {
 		// Gain control over parameter parsing and returned error.
 		let items = items
 			.into_iter()
@@ -348,7 +313,7 @@ where
 			.transpose()?
 			.map(ChildInfo::new_default_from_vec);
 
-		let mut block_guard =
+		let block_guard =
 			match self.subscriptions.lock_block(&follow_subscription, hash, items.len()) {
 				Ok(block) => block,
 				Err(SubscriptionManagementError::SubscriptionAbsent) |
@@ -360,21 +325,17 @@ where
 				Err(_) => return Err(ChainHeadRpcError::InvalidBlock.into()),
 			};
 
-		let mut storage_client = ChainHeadStorage::<Client, Block, BE>::new(
-			self.client.clone(),
-			self.operation_max_storage_items,
-		);
-		let operation = block_guard.operation();
-		let operation_id = operation.operation_id();
+		let storage_client = ChainHeadStorage::<Client, Block, BE>::new(self.client.clone());
+		let operation_id = block_guard.operation_id();
 
 		// The number of operations we are allowed to execute.
-		let num_operations = operation.num_reserved();
+		let num_operations = block_guard.num_reserved();
 		let discarded = items.len().saturating_sub(num_operations);
 		let mut items = items;
 		items.truncate(num_operations);
 
 		let fut = async move {
-			storage_client.generate_events(block_guard, hash, items, child_trie).await;
+			storage_client.generate_events(block_guard, hash, items, child_trie);
 		};
 
 		self.executor
@@ -391,10 +352,10 @@ where
 		hash: Block::Hash,
 		function: String,
 		call_parameters: String,
-	) -> RpcResult<MethodResponse> {
+	) -> Result<MethodResponse, ChainHeadRpcError> {
 		let call_parameters = Bytes::from(parse_hex_param(call_parameters)?);
 
-		let mut block_guard = match self.subscriptions.lock_block(&follow_subscription, hash, 1) {
+		let block_guard = match self.subscriptions.lock_block(&follow_subscription, hash, 1) {
 			Ok(block) => block,
 			Err(SubscriptionManagementError::SubscriptionAbsent) |
 			Err(SubscriptionManagementError::ExceededLimits) => {
@@ -416,33 +377,35 @@ where
 			.into())
 		}
 
-		let operation_id = block_guard.operation().operation_id();
 		let event = self
 			.client
 			.executor()
 			.call(hash, &function, &call_parameters, CallContext::Offchain)
 			.map(|result| {
 				FollowEvent::<Block::Hash>::OperationCallDone(OperationCallDone {
-					operation_id: operation_id.clone(),
+					operation_id: block_guard.operation_id(),
 					output: hex_string(&result),
 				})
 			})
 			.unwrap_or_else(|error| {
 				FollowEvent::<Block::Hash>::OperationError(OperationError {
-					operation_id: operation_id.clone(),
+					operation_id: block_guard.operation_id(),
 					error: error.to_string(),
 				})
 			});
 
 		let _ = block_guard.response_sender().unbounded_send(event);
-		Ok(MethodResponse::Started(MethodResponseStarted { operation_id, discarded_items: None }))
+		Ok(MethodResponse::Started(MethodResponseStarted {
+			operation_id: block_guard.operation_id(),
+			discarded_items: None,
+		}))
 	}
 
 	fn chain_head_unstable_unpin(
 		&self,
 		follow_subscription: String,
 		hash: Block::Hash,
-	) -> RpcResult<()> {
+	) -> Result<(), ChainHeadRpcError> {
 		match self.subscriptions.unpin_block(&follow_subscription, hash) {
 			Ok(()) => Ok(()),
 			Err(SubscriptionManagementError::SubscriptionAbsent) => {
@@ -451,42 +414,9 @@ where
 			},
 			Err(SubscriptionManagementError::BlockHashAbsent) => {
 				// Block is not part of the subscription.
-				Err(ChainHeadRpcError::InvalidBlock.into())
+				Err(ChainHeadRpcError::InvalidBlock)
 			},
-			Err(_) => Err(ChainHeadRpcError::InvalidBlock.into()),
+			Err(_) => Err(ChainHeadRpcError::InvalidBlock),
 		}
-	}
-
-	fn chain_head_unstable_continue(
-		&self,
-		follow_subscription: String,
-		operation_id: String,
-	) -> RpcResult<()> {
-		let Some(operation) = self.subscriptions.get_operation(&follow_subscription, &operation_id)
-		else {
-			return Ok(())
-		};
-
-		if !operation.submit_continue() {
-			// Continue called without generating a `WaitingForContinue` event.
-			Err(ChainHeadRpcError::InvalidContinue.into())
-		} else {
-			Ok(())
-		}
-	}
-
-	fn chain_head_unstable_stop_operation(
-		&self,
-		follow_subscription: String,
-		operation_id: String,
-	) -> RpcResult<()> {
-		let Some(operation) = self.subscriptions.get_operation(&follow_subscription, &operation_id)
-		else {
-			return Ok(())
-		};
-
-		operation.stop_operation();
-
-		Ok(())
 	}
 }

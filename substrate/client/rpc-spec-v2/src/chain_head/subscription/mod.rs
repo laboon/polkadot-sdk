@@ -25,8 +25,6 @@ mod error;
 mod inner;
 
 use self::inner::SubscriptionsInner;
-
-pub use self::inner::OperationState;
 pub use error::SubscriptionManagementError;
 pub use inner::{BlockGuard, InsertedSubscriptionData};
 
@@ -127,11 +125,5 @@ impl<Block: BlockT, BE: Backend<Block>> SubscriptionManagement<Block, BE> {
 	) -> Result<BlockGuard<Block, BE>, SubscriptionManagementError> {
 		let mut inner = self.inner.write();
 		inner.lock_block(sub_id, hash, to_reserve)
-	}
-
-	/// Get the operation state.
-	pub fn get_operation(&self, sub_id: &str, operation_id: &str) -> Option<OperationState> {
-		let mut inner = self.inner.write();
-		inner.get_operation(sub_id, operation_id)
 	}
 }

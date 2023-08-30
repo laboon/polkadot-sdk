@@ -26,24 +26,26 @@ use assert_matches::assert_matches;
 use codec::{Decode, Encode};
 use futures::Future;
 use jsonrpsee::{
-	core::{error::Error, server::rpc_module::Subscription as RpcSubscription},
+	core::{
+		error::Error,
+		server::{RpcModule, Subscription as RpcSubscription},
+		EmptyServerParams as EmptyParams,
+	},
 	rpc_params,
-	types::{error::CallError, EmptyServerParams as EmptyParams},
-	RpcModule,
 };
 use sc_block_builder::BlockBuilderProvider;
 use sc_client_api::ChildInfo;
+use sc_rpc::testing::{test_executor, TokioTestExecutor};
 use sc_service::client::new_in_mem;
 use sp_api::BlockT;
 use sp_blockchain::HeaderBackend;
 use sp_consensus::BlockOrigin;
 use sp_core::{
 	storage::well_known_keys::{self, CODE},
-	testing::TaskExecutor,
 	Blake2Hasher, Hasher,
 };
 use sp_version::RuntimeVersion;
-use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use substrate_test_runtime::Transfer;
 use substrate_test_runtime_client::{
 	prelude::*, runtime, runtime::RuntimeApi, Backend, BlockBuilderExt, Client,
@@ -55,14 +57,12 @@ type Block = substrate_test_runtime_client::runtime::Block;
 const MAX_PINNED_BLOCKS: usize = 32;
 const MAX_PINNED_SECS: u64 = 60;
 const MAX_OPERATIONS: usize = 16;
-const MAX_PAGINATION_LIMIT: usize = 5;
 const CHAIN_GENESIS: [u8; 32] = [0; 32];
 const INVALID_HASH: [u8; 32] = [1; 32];
 const KEY: &[u8] = b":mock";
 const VALUE: &[u8] = b"hello world";
 const CHILD_STORAGE_KEY: &[u8] = b"child";
 const CHILD_VALUE: &[u8] = b"child value";
-const DOES_NOT_PRODUCE_EVENTS_SECONDS: u64 = 10;
 
 async fn get_next_event<T: serde::de::DeserializeOwned>(sub: &mut RpcSubscription) -> T {
 	let (event, _sub_id) = tokio::time::timeout(std::time::Duration::from_secs(60), sub.next())
@@ -71,13 +71,6 @@ async fn get_next_event<T: serde::de::DeserializeOwned>(sub: &mut RpcSubscriptio
 		.unwrap()
 		.unwrap();
 	event
-}
-
-async fn does_not_produce_event<T: serde::de::DeserializeOwned + Debug>(
-	sub: &mut RpcSubscription,
-	duration: std::time::Duration,
-) {
-	tokio::time::timeout(duration, sub.next::<T>()).await.unwrap_err();
 }
 
 async fn run_with_timeout<F: Future>(future: F) -> <F as Future>::Output {
@@ -105,18 +98,17 @@ async fn setup_api() -> (
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [true]).await.unwrap();
 	let sub_id = sub.subscription_id();
 	let sub_id = serde_json::to_string(&sub_id).unwrap();
 
@@ -149,19 +141,18 @@ async fn follow_subscription_produces_blocks() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
 	let finalized_hash = client.info().finalized_hash;
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -211,19 +202,18 @@ async fn follow_with_runtime() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
 	let finalized_hash = client.info().finalized_hash;
-	let mut sub = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [true]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -323,13 +313,12 @@ async fn get_genesis() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -358,7 +347,7 @@ async fn get_header() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(e) if e.code() == 2001 && e.message() == "Invalid block hash"
 	);
 
 	// Obtain the valid header.
@@ -387,7 +376,7 @@ async fn get_body() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(e) if e.code() == 2001 && e.message() == "Invalid block hash"
 	);
 
 	// Valid call.
@@ -468,10 +457,10 @@ async fn call_runtime() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(e) if e.code() == 2001 && e.message() == "Invalid block hash"
 	);
 
-	// Pass an invalid parameters that cannot be decode.
+	// Pass invalid parameters that cannot be decoded.
 	let err = api
 		.call::<_, serde_json::Value>(
 			"chainHead_unstable_call",
@@ -481,7 +470,7 @@ async fn call_runtime() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2003 && err.message().contains("Invalid parameter")
+		Error::Call(err) if err.code() == 2003 && err.message().contains("Invalid parameter")
 	);
 
 	// Valid call.
@@ -533,18 +522,17 @@ async fn call_runtime_without_flag() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 	let sub_id = sub.subscription_id();
 	let sub_id = serde_json::to_string(&sub_id).unwrap();
 
@@ -578,7 +566,7 @@ async fn call_runtime_without_flag() {
 		.unwrap_err();
 
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2003 && err.message().contains("The runtime updates flag must be set")
+		Error::Call(err) if err.code() == 2003 && err.message().contains("The runtime updates flag must be set")
 	);
 }
 
@@ -616,7 +604,7 @@ async fn get_storage_hash() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(err) if err.code() == 2001 && err.message() == "Invalid block hash"
 	);
 
 	// Valid call without storage at the key.
@@ -754,12 +742,12 @@ async fn get_storage_multi_query_iter() {
 				vec![
 					StorageQuery {
 						key: key.clone(),
-						query_type: StorageQueryType::DescendantsHashes
+						query_type: StorageQueryType::DescendantsHashes,
 					},
 					StorageQuery {
 						key: key.clone(),
-						query_type: StorageQueryType::DescendantsValues
-					}
+						query_type: StorageQueryType::DescendantsValues,
+					},
 				]
 			],
 		)
@@ -775,16 +763,11 @@ async fn get_storage_multi_query_iter() {
 	assert_matches!(
 		get_next_event::<FollowEvent<String>>(&mut block_sub).await,
 		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
+			res.items.len() == 2 &&
 			res.items[0].key == key &&
-			res.items[0].result == StorageResultType::Hash(expected_hash)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut block_sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == key &&
-			res.items[0].result == StorageResultType::Value(expected_value)
+			res.items[1].key == key &&
+			res.items[0].result == StorageResultType::Hash(expected_hash) &&
+			res.items[1].result == StorageResultType::Value(expected_value)
 	);
 	assert_matches!(
 			get_next_event::<FollowEvent<String>>(&mut block_sub).await,
@@ -805,12 +788,12 @@ async fn get_storage_multi_query_iter() {
 				vec![
 					StorageQuery {
 						key: key.clone(),
-						query_type: StorageQueryType::DescendantsHashes
+						query_type: StorageQueryType::DescendantsHashes,
 					},
 					StorageQuery {
 						key: key.clone(),
-						query_type: StorageQueryType::DescendantsValues
-					}
+						query_type: StorageQueryType::DescendantsValues,
+					},
 				],
 				&child_info
 			],
@@ -825,16 +808,11 @@ async fn get_storage_multi_query_iter() {
 	assert_matches!(
 		get_next_event::<FollowEvent<String>>(&mut block_sub).await,
 		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
+			res.items.len() == 2 &&
 			res.items[0].key == key &&
-			res.items[0].result == StorageResultType::Hash(expected_hash)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut block_sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == key &&
-			res.items[0].result == StorageResultType::Value(expected_value)
+			res.items[1].key == key &&
+			res.items[0].result == StorageResultType::Hash(expected_hash) &&
+			res.items[1].result == StorageResultType::Value(expected_value)
 	);
 	assert_matches!(
 			get_next_event::<FollowEvent<String>>(&mut block_sub).await,
@@ -876,7 +854,7 @@ async fn get_storage_value() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(err) if err.code() == 2001 && err.message() == "Invalid block hash"
 	);
 
 	// Valid call without storage at the key.
@@ -1173,23 +1151,23 @@ async fn separate_operation_ids_for_subscriptions() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
 	// Create two separate subscriptions.
-	let mut sub_first = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
+	let mut sub_first = api.subscribe_unbounded("chainHead_unstable_follow", [true]).await.unwrap();
 	let sub_id_first = sub_first.subscription_id();
 	let sub_id_first = serde_json::to_string(&sub_id_first).unwrap();
 
-	let mut sub_second = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
+	let mut sub_second =
+		api.subscribe_unbounded("chainHead_unstable_follow", [true]).await.unwrap();
 	let sub_id_second = sub_second.subscription_id();
 	let sub_id_second = serde_json::to_string(&sub_id_second).unwrap();
 
@@ -1254,13 +1232,12 @@ async fn follow_generates_initial_blocks() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -1294,7 +1271,7 @@ async fn follow_generates_initial_blocks() {
 	let block_3_hash = block_3.header.hash();
 	client.import(BlockOrigin::Own, block_3.clone()).await.unwrap();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -1386,18 +1363,17 @@ async fn follow_exceeding_pinned_blocks() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: 2,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
 	client.import(BlockOrigin::Own, block.clone()).await.unwrap();
@@ -1441,18 +1417,17 @@ async fn follow_with_unpin() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: 2,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 	let sub_id = sub.subscription_id();
 	let sub_id = serde_json::to_string(&sub_id).unwrap();
 
@@ -1488,7 +1463,7 @@ async fn follow_with_unpin() {
 		.await
 		.unwrap_err();
 	assert_matches!(err,
-		Error::Call(CallError::Custom(ref err)) if err.code() == 2001 && err.message() == "Invalid block hash"
+		Error::Call(err) if err.code() == 2001 && err.message() == "Invalid block hash"
 	);
 
 	// To not exceed the number of pinned blocks, we need to unpin before the next import.
@@ -1526,19 +1501,18 @@ async fn follow_prune_best_block() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
 	let finalized_hash = client.info().finalized_hash;
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -1687,13 +1661,12 @@ async fn follow_forks_pruned_block() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -1747,7 +1720,7 @@ async fn follow_forks_pruned_block() {
 	// Block 4 and 5 are not pruned, pruning happens at height (N - 1).
 	client.finalize_block(block_3_hash, None).unwrap();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -1805,13 +1778,12 @@ async fn follow_report_multiple_pruned_block() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -1866,7 +1838,7 @@ async fn follow_report_multiple_pruned_block() {
 	let block_5 = block_builder.build().unwrap().block;
 	let block_5_hash = block_5.header.hash();
 	client.import(BlockOrigin::Own, block_5.clone()).await.unwrap();
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Initialized must always be reported first.
 	let event: FollowEvent<String> = get_next_event(&mut sub).await;
@@ -2005,7 +1977,7 @@ async fn pin_block_references() {
 			genesis_block_builder,
 			None,
 			None,
-			Box::new(TaskExecutor::new()),
+			Box::new(TokioTestExecutor::default()),
 			client_config,
 		)
 		.unwrap(),
@@ -2014,13 +1986,12 @@ async fn pin_block_references() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend.clone(),
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: 3,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -2042,7 +2013,7 @@ async fn pin_block_references() {
 		}
 	}
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 	let sub_id = sub.subscription_id();
 	let sub_id = serde_json::to_string(&sub_id).unwrap();
 
@@ -2128,13 +2099,12 @@ async fn follow_finalized_before_new_block() {
 	let api = ChainHead::new(
 		client_mock.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
@@ -2144,7 +2114,7 @@ async fn follow_finalized_before_new_block() {
 	let block_1_hash = block_1.header.hash();
 	client.import(BlockOrigin::Own, block_1.clone()).await.unwrap();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [false]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [false]).await.unwrap();
 
 	// Trigger the `FinalizedNotification` for block 1 before the `BlockImportNotification`, and
 	// expect for the `chainHead` to generate `NewBlock`, `BestBlock` and `Finalized` events.
@@ -2229,18 +2199,17 @@ async fn ensure_operation_limits_works() {
 	let api = ChainHead::new(
 		client.clone(),
 		backend,
-		Arc::new(TaskExecutor::default()),
+		test_executor(),
 		CHAIN_GENESIS,
 		ChainHeadConfig {
 			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
 			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
 			subscription_max_ongoing_operations: 1,
-			operation_max_storage_items: MAX_PAGINATION_LIMIT,
 		},
 	)
 	.into_rpc();
 
-	let mut sub = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
+	let mut sub = api.subscribe_unbounded("chainHead_unstable_follow", [true]).await.unwrap();
 	let sub_id = sub.subscription_id();
 	let sub_id = serde_json::to_string(&sub_id).unwrap();
 
@@ -2310,276 +2279,4 @@ async fn ensure_operation_limits_works() {
 			get_next_event::<FollowEvent<String>>(&mut sub).await,
 			FollowEvent::OperationCallDone(done) if done.operation_id == operation_id && done.output == "0x0000000000000000"
 	);
-}
-
-#[tokio::test]
-async fn check_continue_operation() {
-	let child_info = ChildInfo::new_default(CHILD_STORAGE_KEY);
-	let builder = TestClientBuilder::new().add_extra_child_storage(
-		&child_info,
-		KEY.to_vec(),
-		CHILD_VALUE.to_vec(),
-	);
-	let backend = builder.backend();
-	let mut client = Arc::new(builder.build());
-
-	// Configure the chainHead with maximum 1 item before asking for pagination.
-	let api = ChainHead::new(
-		client.clone(),
-		backend,
-		Arc::new(TaskExecutor::default()),
-		CHAIN_GENESIS,
-		ChainHeadConfig {
-			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
-			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
-			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: 1,
-		},
-	)
-	.into_rpc();
-
-	let mut sub = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
-	let sub_id = sub.subscription_id();
-	let sub_id = serde_json::to_string(&sub_id).unwrap();
-
-	// Import a new block with storage changes.
-	let mut builder = client.new_block(Default::default()).unwrap();
-	builder.push_storage_change(b":m".to_vec(), Some(b"a".to_vec())).unwrap();
-	builder.push_storage_change(b":mo".to_vec(), Some(b"ab".to_vec())).unwrap();
-	builder.push_storage_change(b":moc".to_vec(), Some(b"abc".to_vec())).unwrap();
-	builder.push_storage_change(b":mock".to_vec(), Some(b"abcd".to_vec())).unwrap();
-	let block = builder.build().unwrap().block;
-	let block_hash = format!("{:?}", block.header.hash());
-	client.import(BlockOrigin::Own, block.clone()).await.unwrap();
-
-	// Ensure the imported block is propagated and pinned for this subscription.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::Initialized(_)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::NewBlock(_)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::BestBlockChanged(_)
-	);
-
-	let invalid_hash = hex_string(&INVALID_HASH);
-
-	// Invalid subscription ID must produce no results.
-	let _res: () = api
-		.call("chainHead_unstable_continue", ["invalid_sub_id", &invalid_hash])
-		.await
-		.unwrap();
-
-	// Invalid operation ID must produce no results.
-	let _res: () = api.call("chainHead_unstable_continue", [&sub_id, &invalid_hash]).await.unwrap();
-
-	// Valid call with storage at the key.
-	let response: MethodResponse = api
-		.call(
-			"chainHead_unstable_storage",
-			rpc_params![
-				&sub_id,
-				&block_hash,
-				vec![StorageQuery {
-					key: hex_string(b":m"),
-					query_type: StorageQueryType::DescendantsValues
-				}]
-			],
-		)
-		.await
-		.unwrap();
-	let operation_id = match response {
-		MethodResponse::Started(started) => started.operation_id,
-		MethodResponse::LimitReached => panic!("Expected started response"),
-	};
-
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == hex_string(b":m") &&
-			res.items[0].result == StorageResultType::Value(hex_string(b"a"))
-	);
-
-	// Pagination event.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationWaitingForContinue(res) if res.operation_id == operation_id
-	);
-
-	does_not_produce_event::<FollowEvent<String>>(
-		&mut sub,
-		std::time::Duration::from_secs(DOES_NOT_PRODUCE_EVENTS_SECONDS),
-	)
-	.await;
-	let _res: () = api.call("chainHead_unstable_continue", [&sub_id, &operation_id]).await.unwrap();
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == hex_string(b":mo") &&
-			res.items[0].result == StorageResultType::Value(hex_string(b"ab"))
-	);
-
-	// Pagination event.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationWaitingForContinue(res) if res.operation_id == operation_id
-	);
-
-	does_not_produce_event::<FollowEvent<String>>(
-		&mut sub,
-		std::time::Duration::from_secs(DOES_NOT_PRODUCE_EVENTS_SECONDS),
-	)
-	.await;
-	let _res: () = api.call("chainHead_unstable_continue", [&sub_id, &operation_id]).await.unwrap();
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == hex_string(b":moc") &&
-			res.items[0].result == StorageResultType::Value(hex_string(b"abc"))
-	);
-
-	// Pagination event.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationWaitingForContinue(res) if res.operation_id == operation_id
-	);
-	does_not_produce_event::<FollowEvent<String>>(
-		&mut sub,
-		std::time::Duration::from_secs(DOES_NOT_PRODUCE_EVENTS_SECONDS),
-	)
-	.await;
-	let _res: () = api.call("chainHead_unstable_continue", [&sub_id, &operation_id]).await.unwrap();
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == hex_string(b":mock") &&
-			res.items[0].result == StorageResultType::Value(hex_string(b"abcd"))
-	);
-
-	// Finished.
-	assert_matches!(
-			get_next_event::<FollowEvent<String>>(&mut sub).await,
-			FollowEvent::OperationStorageDone(done) if done.operation_id == operation_id
-	);
-}
-
-#[tokio::test]
-async fn stop_storage_operation() {
-	let child_info = ChildInfo::new_default(CHILD_STORAGE_KEY);
-	let builder = TestClientBuilder::new().add_extra_child_storage(
-		&child_info,
-		KEY.to_vec(),
-		CHILD_VALUE.to_vec(),
-	);
-	let backend = builder.backend();
-	let mut client = Arc::new(builder.build());
-
-	// Configure the chainHead with maximum 1 item before asking for pagination.
-	let api = ChainHead::new(
-		client.clone(),
-		backend,
-		Arc::new(TaskExecutor::default()),
-		CHAIN_GENESIS,
-		ChainHeadConfig {
-			global_max_pinned_blocks: MAX_PINNED_BLOCKS,
-			subscription_max_pinned_duration: Duration::from_secs(MAX_PINNED_SECS),
-			subscription_max_ongoing_operations: MAX_OPERATIONS,
-			operation_max_storage_items: 1,
-		},
-	)
-	.into_rpc();
-
-	let mut sub = api.subscribe("chainHead_unstable_follow", [true]).await.unwrap();
-	let sub_id = sub.subscription_id();
-	let sub_id = serde_json::to_string(&sub_id).unwrap();
-
-	// Import a new block with storage changes.
-	let mut builder = client.new_block(Default::default()).unwrap();
-	builder.push_storage_change(b":m".to_vec(), Some(b"a".to_vec())).unwrap();
-	builder.push_storage_change(b":mo".to_vec(), Some(b"ab".to_vec())).unwrap();
-	let block = builder.build().unwrap().block;
-	let block_hash = format!("{:?}", block.header.hash());
-	client.import(BlockOrigin::Own, block.clone()).await.unwrap();
-
-	// Ensure the imported block is propagated and pinned for this subscription.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::Initialized(_)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::NewBlock(_)
-	);
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::BestBlockChanged(_)
-	);
-
-	let invalid_hash = hex_string(&INVALID_HASH);
-
-	// Invalid subscription ID must produce no results.
-	let _res: () = api
-		.call("chainHead_unstable_stopOperation", ["invalid_sub_id", &invalid_hash])
-		.await
-		.unwrap();
-
-	// Invalid operation ID must produce no results.
-	let _res: () = api
-		.call("chainHead_unstable_stopOperation", [&sub_id, &invalid_hash])
-		.await
-		.unwrap();
-
-	// Valid call with storage at the key.
-	let response: MethodResponse = api
-		.call(
-			"chainHead_unstable_storage",
-			rpc_params![
-				&sub_id,
-				&block_hash,
-				vec![StorageQuery {
-					key: hex_string(b":m"),
-					query_type: StorageQueryType::DescendantsValues
-				}]
-			],
-		)
-		.await
-		.unwrap();
-	let operation_id = match response {
-		MethodResponse::Started(started) => started.operation_id,
-		MethodResponse::LimitReached => panic!("Expected started response"),
-	};
-
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationStorageItems(res) if res.operation_id == operation_id &&
-			res.items.len() == 1 &&
-			res.items[0].key == hex_string(b":m") &&
-			res.items[0].result == StorageResultType::Value(hex_string(b"a"))
-	);
-
-	// Pagination event.
-	assert_matches!(
-		get_next_event::<FollowEvent<String>>(&mut sub).await,
-		FollowEvent::OperationWaitingForContinue(res) if res.operation_id == operation_id
-	);
-
-	// Stop the operation.
-	let _res: () = api
-		.call("chainHead_unstable_stopOperation", [&sub_id, &operation_id])
-		.await
-		.unwrap();
-
-	does_not_produce_event::<FollowEvent<String>>(
-		&mut sub,
-		std::time::Duration::from_secs(DOES_NOT_PRODUCE_EVENTS_SECONDS),
-	)
-	.await;
 }
