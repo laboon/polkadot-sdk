@@ -247,13 +247,13 @@ impl sc_transaction_pool::ChainApi for TestApi {
 
 	fn validate_transaction(
 		&self,
-		at: &BlockId<Self::Block>,
+		at: <Self::Block as BlockT>::Hash,
 		_source: TransactionSource,
 		uxt: <Self::Block as BlockT>::Extrinsic,
 	) -> Self::ValidationFuture {
 		self.validation_requests.write().push(uxt.clone());
 
-		match self.block_id_to_number(at) {
+		match self.block_id_to_number(&BlockId::Hash(at)) {
 			Ok(Some(number)) => {
 				let found_best = self
 					.chain
